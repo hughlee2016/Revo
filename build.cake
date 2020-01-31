@@ -1,10 +1,6 @@
 #r "System.IO.Compression.FileSystem"
 #r "System.Xml"
 
-//#tool "nuget:?package=xunit.runner.console"
-//#tool "nuget:?package=OpenCover"
-#addin "Cake.Incubator"
-
 using System.IO.Compression;
 using System.Net;
 using System.Xml;
@@ -27,31 +23,24 @@ var SolutionFile = System.IO.Path.Combine(SolutionDir, "Revo.sln");
 var PackagesDir = System.IO.Path.Combine(SolutionDir, "build", "packages");
 var ReportsDir = System.IO.Path.Combine(SolutionDir, "build", "reports");
 
-bool IsCiBuild = AppVeyor.IsRunningOnAppVeyor;
+bool IsCiBuild = BuildSystem.IsRunningOnAzurePipelinesHosted;
 
 int? BuildNumber =
     HasArgument("BuildNumber") ? (int?)Argument<int>("BuildNumber") :
-    AppVeyor.IsRunningOnAppVeyor ? (int?)AppVeyor.Environment.Build.Number :
+    BuildSystem.IsRunningOnAzurePipelinesHosted ? TFBuild.Environment.Build.Id :
     EnvironmentVariable("BuildNumber") != null ? (int?)int.Parse(EnvironmentVariable("BuildNumber")) : null;
-
-string VersionSuffix = HasArgument("VersionSuffix") ? Argument<string>("VersionSuffix") : null;
-
-// load VersionSuffix (if explicitly specified in Common.props)
-if (VersionSuffix == null)
-{
-  var xmlDocument = new XmlDocument();
-  xmlDocument.Load(System.IO.Path.Combine(SolutionDir, "Common.props"));
-
-  var node = xmlDocument.SelectSingleNode("Project/PropertyGroup/VersionSuffix") as XmlElement;
-  if (node != null)
-  {
-    VersionSuffix = node.InnerText;
-  }
-}
+    
+var xmlDocument = new XmlDocument();
+xmlDocument.Load(System.IO.Path.Combine(SolutionDir, "Common.props"));
+	
+string VersionPrefix = ((XmlElement)xmlDocument.SelectSingleNode("Project/PropertyGroup/VersionPrefix")).InnerText;
+string VersionSuffix = HasArgument("VersionSuffix")
+	? Argument<string>("VersionSuffix")
+	: (xmlDocument.SelectSingleNode("Project/PropertyGroup/VersionSuffix") as XmlElement)?.InnerText;
 
 // append the VersionSuffix for non-release CI builds
-string ciTag = AppVeyor.Environment.Repository.Tag.IsTag ? AppVeyor.Environment.Repository.Tag.Name : null;
-string ciBranch = AppVeyor.IsRunningOnAppVeyor ? AppVeyor.Environment.Repository.Branch : null;
+string ciTag = BuildSystem.IsRunningOnAzurePipelinesHosted && TFBuild.Environment.Repository.Branch.StartsWith("refs/tags/") ? TFBuild.Environment.Repository.Branch.Substring("refs/tags/".Length) : null;
+string ciBranch = BuildSystem.IsRunningOnAzurePipelinesHosted ? TFBuild.Environment.Repository.Branch : null;
 
 if (BuildNumber.HasValue && ciTag == null && (string.IsNullOrWhiteSpace(ciBranch) || ciBranch != "master"))
 {
@@ -60,9 +49,11 @@ if (BuildNumber.HasValue && ciTag == null && (string.IsNullOrWhiteSpace(ciBranch
     : $"build{BuildNumber:00000}";
 }
 
-string GetXunitXmlReportFilePath(FilePath projectFile)
+string Version = VersionSuffix?.Length > 0 ? $"{VersionPrefix}-{VersionSuffix}" : VersionPrefix;
+
+if (BuildSystem.IsRunningOnAzurePipelinesHosted)
 {
-  return new DirectoryPath(ReportsDir).CombineWithFilePath(projectFile.GetFilenameWithoutExtension()).FullPath + ".xml";
+  TFBuild.Commands.UpdateBuildNumber(Version);
 }
 
 Task("Default")
@@ -75,18 +66,13 @@ Task("Clean")
     {
       CleanDirectories(new []{ PackagesDir, ReportsDir });
 
-      var msbuildSettings = new MSBuildSettings
+      DotNetCoreClean(SolutionFile,
+        new DotNetCoreCleanSettings()
         {
-          Verbosity = Verbosity.Minimal,
-          ToolVersion = MSBuildToolVersion.VS2019,
+          Verbosity = DotNetCoreVerbosity.Minimal,
           Configuration = Configuration,
-          PlatformTarget = PlatformTarget.MSIL,
           ArgumentCustomization = args => args
-        };
-
-      msbuildSettings.Targets.Add("Clean");
-
-      MSBuild(SolutionFile, msbuildSettings);
+        });
     }
   });
 
@@ -96,11 +82,11 @@ Task("Restore")
   {
     if (IsRestoreEnabled)
     {
-      NuGetRestore(
+      DotNetCoreRestore(
         SolutionFile,
-        new NuGetRestoreSettings ()
+        new DotNetCoreRestoreSettings ()
         {
-          Verbosity = NuGetVerbosity.Normal
+          Verbosity = DotNetCoreVerbosity.Normal
         });
     }
   });
@@ -111,19 +97,13 @@ Task("Build")
   {
     if (IsBuildEnabled)
     {
-      MSBuild(SolutionFile,
-        new MSBuildSettings
+      DotNetCoreBuild(SolutionFile,
+        new DotNetCoreBuildSettings
         {
-          Verbosity = Verbosity.Minimal,
-          ToolVersion = MSBuildToolVersion.VS2019,
+          Verbosity = DotNetCoreVerbosity.Minimal,
           Configuration = Configuration,
-          PlatformTarget = PlatformTarget.MSIL,
+          VersionSuffix = VersionSuffix,
           ArgumentCustomization = args => args
-            .Append($"/p:VersionSuffix={VersionSuffix}")
-            .Append("/p:ci=true")
-            .AppendSwitch("/p:DebugType", "=", Configuration == "Release" ? "portable" : "full")
-            .AppendSwitch("/p:ContinuousIntegrationBuild", "=", IsCiBuild ? "true" : "false")
-            .AppendSwitch("/p:DeterministicSourcePaths", "=", "false") // Temporary workaround for https://github.com/dotnet/sourcelink/issues/91
         });
     }
   });
@@ -140,9 +120,17 @@ Task("Test")
           Configuration = Configuration,
           NoBuild = true,
           NoRestore = true,
-          Verbosity = DotNetCoreVerbosity.Minimal
+          Verbosity = DotNetCoreVerbosity.Minimal,
+          ResultsDirectory = ReportsDir,
+          Logger = "trx",
+          ArgumentCustomization = args =>
+            args
+              .Append("/p:CollectCoverage={0}", "true")
+              .Append("/p:CoverletOutput={0}/", ReportsDir)
+              .Append("/p:UseSourceLink={0}", "true")
+              .Append("/p:CoverletOutputFormat={0}", "cobertura")
         });
-     }
+    }
   });
 
 Task("Pack")
